@@ -1,14 +1,14 @@
 #include <NewPing.h>
 #include <LiquidCrystal.h>
 
-#define WATERMODE true  // CHANGE THIS TO "false" for the Oil sensor configuration
+#define WATERMODE false  // CHANGE THIS TO "false" for the Oil sensor configuration
 
 //These Settings define the physical pins used for the various inputs/outputs
 #define TRIGGER_PIN  13  // Arduino pin tied to trigger pin on ping sensor.
 #define ECHO_PIN     12  // Arduino pin tied to echo pin on ping sensor.
 #define BUZZER_PIN   4   // Arduino pin tied to buzzer
 
-#if WATERMODE == true
+#if WATERMODE == false
 #define SOLENOID_PIN 3   // Arduino pin tied to solenoid valve
 #endif
 
@@ -25,10 +25,10 @@ unsigned long refreshTimer; // holds the time since the last display update
 unsigned long refreshDuration = 10000; // holds the interval to refresh screen / serial output (in milliseconds)
 
 //These settings control the error threshold when no data is receieved from the ultrasonic sensor
-unsigned long inputTimer; // holds the time since the last sensor was recieved
+volatile unsigned long inputTimer; // holds the time since the last sensor was recieved
 unsigned long inputTimeout = 300000; // Duration in seconds to wait for sensor data before sounding the alarm  [5 minutes](in milliseconds)
 
-bool inputError = false; // Boolean to hold the alarm state when no data is recieved from the sensor
+volatile bool inputError = false; // Boolean to hold the alarm state when no data is recieved from the sensor
 bool lowLevel = false; // Booolean to hold the level status
 
 
@@ -103,9 +103,9 @@ void loop() {
     }
   // Do other stuff here, really. Think of it as multi-tasking.
 
-  checkError();
-
+ 
   if( millis() - refreshDuration > refreshTimer ) {
+    checkError();
     refreshTimer = millis();
     if(inputError) {
       writeError();
@@ -138,7 +138,10 @@ void echoCheck() { // Timer2 interrupt calls this function every 24uS where you 
 }
 
 void checkError() {
-  if( millis() - inputTimer > inputTimeout ) {
+ unsigned long currentMillis = millis();
+ unsigned long timeSinceLastPing = (currentMillis - inputTimer);
+  
+  if( timeSinceLastPing > inputTimeout ) {
     inputError = true;
   }
 }
@@ -176,13 +179,19 @@ float getRemainingPercentage() {
 }
 
 void writeError() {
-  long errorDuration = millis() - inputTimer;
-  String msg = "Error: No sensor data for " + (String)(errorDuration/1000) + " seconds";
+  unsigned long currentMillis = millis();
+  unsigned long timeSinceLastPing = (currentMillis - inputTimer);
+ 
+  int errorDuration = timeSinceLastPing/1000;
+  String msg = "Error: No sensor data for " + (String)errorDuration + " seconds";
   updateConsole(msg);
+  updateConsole("Current Millis: " + (String)currentMillis + ", Last Ping Millis: " + (String)timeSinceLastPing);
   
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(msg);
+  lcd.print("No Sensor Data");
+  lcd.setCursor(0, 1);
+  lcd.print("in " + (String)errorDuration + "s");
 }
 
 void enableAlarm() {
