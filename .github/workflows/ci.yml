@@ -24,4 +24,4 @@ jobs:
           ./bin/arduino-cli lib install "PubSubClient"
 
       - name: Compile
-        run: ./bin/arduino-cli compile --fqbn arduino:megaavr:uno2018 --log --log-level trace . --build-property build.extra_flags="-DCI_BUILD -D__AVR__"
+        run: ./bin/arduino-cli compile --fqbn arduino:megaavr:uno2018 --log --log-level trace . --build-property build.extra_flags="-DARDUINO=10607 -DARDUINO_AVR_UNO_WIFI_REV2 -DARDUINO_ARCH_MEGAAVR -DUNO_WIFI_REV2_328MODE"
