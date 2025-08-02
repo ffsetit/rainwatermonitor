@@ -13,7 +13,7 @@ jobs:
         with:
           fqbn: "arduino:megaavr:uno2018"
           sketch-paths: |
-            - rainwatermonitor
+            - ../rainwatermonitor
           libraries: |
             - name: NewPing
               version: 1.9.7
