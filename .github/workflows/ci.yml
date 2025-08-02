@@ -1,0 +1,27 @@
+name: Arduino CI
+on: [pull_request]
+
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Arduino CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          ./bin/arduino-cli config init
+          ./bin/arduino-cli core update-index
+          ./bin/arduino-cli core install arduino:avr
+          ./bin/arduino-cli core install arduino:megaavr
+
+      - name: Install Arduino Libraries
+        run: |
+          ./bin/arduino-cli lib install "NewPing"
+          ./bin/arduino-cli lib install "LiquidCrystal"
+          ./bin/arduino-cli lib install "WiFiNINA"
+          ./bin/arduino-cli lib install "PubSubClient"
+
+      - name: Compile
+        run: ./bin/arduino-cli compile --fqbn arduino:megaavr:uno2018 .
