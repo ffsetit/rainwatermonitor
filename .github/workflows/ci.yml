@@ -24,5 +24,5 @@ jobs:
             - name: PubSubClient
               version: 2.8.0
           cli-compile-flags: |
-            --build-property "build.extra_flags=-DCI_BUILD"
+            - "--build-property \"build.extra_flags=-DCI_BUILD\""
           verbose: true
