@@ -1,53 +1,41 @@
 #include <NewPing.h>
 #include <LiquidCrystal.h>
-
-#define WATERMODE false  // CHANGE THIS TO "false" for the Oil sensor configuration
+#include "wifi.h"
 
 //These Settings define the physical pins used for the various inputs/outputs
 #define TRIGGER_PIN  13  // Arduino pin tied to trigger pin on ping sensor.
 #define ECHO_PIN     12  // Arduino pin tied to echo pin on ping sensor.
 #define BUZZER_PIN   4   // Arduino pin tied to buzzer
-
-#if WATERMODE == false
 #define SOLENOID_PIN 3   // Arduino pin tied to solenoid valve
-#endif
 
 #define MAX_DISTANCE 250 // Maximum distance we want to ping for (in centimeters). Maximum sensor distance is rated at 400-500cm.
 #define NUM_READINGS 10
 
 NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE); // NewPing setup of pins and maximum distance.
 
+const bool debug = false;
+
 unsigned int pingSpeed = 2500; // How frequently are we going to send out a ping (in milliseconds). 50ms would be 20 times a second.
 unsigned long pingTimer;     // Holds the next ping time.
 
 //These setting control how often the LCD Display is updated
 unsigned long refreshTimer; // holds the time since the last display update
-unsigned long refreshDuration = 10000; // holds the interval to refresh screen / serial output (in milliseconds)
+const unsigned long refreshDuration = 10000; // holds the interval to refresh screen / serial output (in milliseconds)
 
 //These settings control the error threshold when no data is receieved from the ultrasonic sensor
 volatile unsigned long inputTimer; // holds the time since the last sensor was recieved
 unsigned long inputTimeout = 300000; // Duration in seconds to wait for sensor data before sounding the alarm  [5 minutes](in milliseconds)
 
 volatile bool inputError = false; // Boolean to hold the alarm state when no data is recieved from the sensor
-bool lowLevel = false; // Booolean to hold the level status
+bool levelAlarm = false; // Booolean to hold the level status
 
 
 // These settings define the parameters of the tank
-#if WATERMODE == true
-int sensorHeight = 200; // Height of the sensor above the bottom of the tank
+bool fill = false; // Used to track if the tank is currently filling
+int sensorHeight = 197; // Height of the sensor above the bottom of the tank
 int tankDepth = 170; // Maximum depth of the tank content
 int minDepth = 10; // Level at which the low level alarm is triggered
-#else
-int sensorHeight = 110; // Height of Sensor from Bottom of the tank
-int tankDepth = 95; // Maximum depth of oil in the tank
-int minDepth = 30; // Minimum depth to trigger alarm
-#endif
-
 bool initialized = false; // Value used to determine if the ultra sonic sensor is connected and has returned a valid reading
-
-#if WATERMODE == true
-bool fill = false; // Used to track if the tank is currently filling
-#endif
 
 int readingPos = 0; // Array index used to determine where to store the latest depth reading
 int readings[NUM_READINGS]; //  Array of depth readings
@@ -63,13 +51,11 @@ void setup() {
     Serial.begin(115200); // Open serial monitor at 115200 baud to see ping results.
 
     updateConsole("==================");
-    updateConsole("Controller Mode: " + (String)(WATERMODE ? "Water" : "Oil"));
+    updateConsole("Controller Mode: Water" );
     updateConsole("Sensor Echo Pin: " + (String) ECHO_PIN);
     updateConsole("Sensor Trigger Pin: " + (String) TRIGGER_PIN);
     updateConsole("Sensor Interval: " + (String) (pingSpeed/1000) + "s");
-    #if WATERMODE == true
     updateConsole("Solenoid Pin: " + (String) SOLENOID_PIN);
-    #endif
     updateConsole("Alarm Pin: " + (String) BUZZER_PIN);
     updateConsole("Tank Max Depth: " + (String) tankDepth + "cm");
     updateConsole("Sensor Height: " + (String) sensorHeight + "cm");
@@ -80,7 +66,7 @@ void setup() {
   
   pingTimer = millis(); // Start now.
   inputTimer = millis(); // Start now.
-  refreshTimer = millis()-refreshDuration; // Start now.
+  refreshTimer = millis(); // Start now.
   
   lcd.begin(16, 2); // lcd starts with resolution 16x2
   lcd.setCursor(0, 0);
@@ -88,11 +74,11 @@ void setup() {
   lcd.setCursor(0, 1);
   lcd.print("  Depth Sensor");
 
+  configureWifi();
+
   updateConsole("Initializing Depth Sensor");
   
-#if WATERMODE == true
   pinMode(SOLENOID_PIN, OUTPUT);
-#endif
   pinMode(BUZZER_PIN, OUTPUT);
 }
 
@@ -102,27 +88,40 @@ void loop() {
       sonar.ping_timer(echoCheck); // Send out the ping, calls "echoCheck" function every 24uS where you can check the ping status.
     }
   // Do other stuff here, really. Think of it as multi-tasking.
+  
+  pollMqtt();
 
- 
-  if( millis() - refreshDuration > refreshTimer ) {
+  unsigned long now = millis();
+  if( now  - refreshDuration > refreshTimer ) {
+    if(debug) {
+      updateConsole("Refreshing....");
+    }
+
+    refreshTimer = now;
     checkError();
-    refreshTimer = millis();
+    
     if(inputError) {
       writeError();
       enableAlarm();
-      #if WATERMODE == true
       closeTap();
-      #endif
     }
-    if (lowLevel) {
+    if (levelAlarm) {
       enableAlarm();
-      #if WATERMODE == true
       openTap();
-      #endif
     } 
-    if(!inputError and !lowLevel) {
+    if(!inputError and !levelAlarm) {
       disableAlarm();
     }
+
+    if(!checkConnection())
+    {
+      configureWifi();
+    }
+    if(!checkMqttConnection()){
+      connectToMqtt();
+    }
+    
+    publishSensorData(getAverageDepth(), fill, levelAlarm or inputError, inputError ? getErrorMessage() : "", inputTimer);
   }
 }
 
@@ -131,6 +130,7 @@ void echoCheck() { // Timer2 interrupt calls this function every 24uS where you 
   if (sonar.check_timer()) { // This is how you check to see if the ping was received.
     inputTimer = millis(); // Update last ping recieved time
     int depth = sensorHeight - (sonar.ping_result / US_ROUNDTRIP_CM);
+
     inputError = false;
     updateResults(depth);
   }
@@ -138,15 +138,23 @@ void echoCheck() { // Timer2 interrupt calls this function every 24uS where you 
 }
 
 void checkError() {
- unsigned long currentMillis = millis();
- unsigned long timeSinceLastPing = (currentMillis - inputTimer);
-  
+  if(debug) {
+    updateConsole("checkError Called");
+  }
+
+  unsigned long currentMillis = millis();
+  unsigned long timeSinceLastPing = (currentMillis - inputTimer);
+
   if( timeSinceLastPing > inputTimeout ) {
     inputError = true;
   }
 }
 
 void updateResults(int depth) {
+  if(debug) {
+    updateConsole("updateResults Called");
+  }
+
   inputTimer = millis(); // Update last ping recieved time
   if(readingPos >= NUM_READINGS) {
     readingPos = 0;
@@ -156,7 +164,11 @@ void updateResults(int depth) {
   }
   readings[readingPos] = depth;
   if(initialized) {
-    lowLevel = getAverageDepth() < minDepth; //Set error if the level is below minimum
+    #if HIGHLEVEL == true
+      levelAlarm = getAverageDepth() > maxDepth; //Set error if the level is above maximum
+    #else
+      levelAlarm = getAverageDepth() < minDepth; //Set error if the level is below minimum
+    #endif
   }
   updateDisplay();
 }
@@ -174,29 +186,41 @@ float getRemainingPercentage() {
 
   float avg = getAverageDepth();
   float percentRemaining = (avg / (float)tankDepth) * 100;
-
   return percentRemaining;
 }
 
-void writeError() {
+int getErrorDuration() {
   unsigned long currentMillis = millis();
   unsigned long timeSinceLastPing = (currentMillis - inputTimer);
- 
-  int errorDuration = timeSinceLastPing/1000;
-  String msg = "Error: No sensor data for " + (String)errorDuration + " seconds";
+
+  return timeSinceLastPing/1000;
+}
+
+String getErrorMessage() {
+  if(debug) {
+    updateConsole("getErrorMessage Called");
+  }
+
+  String msg = "No sensor data for " + (String)getErrorDuration() + " seconds";
+  return msg;
+}
+
+void writeError() {
+  String msg = getErrorMessage();
   updateConsole(msg);
-  updateConsole("Current Millis: " + (String)currentMillis + ", Last Ping Millis: " + (String)timeSinceLastPing);
   
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("No Sensor Data");
   lcd.setCursor(0, 1);
-  lcd.print("in " + (String)errorDuration + "s");
+  lcd.print("in " + (String)getErrorDuration() + "s");
+
 }
 
 void enableAlarm() {
   if(0 == digitalRead(BUZZER_PIN)) {
     digitalWrite(BUZZER_PIN, HIGH);
+    //analogWrite(BUZZER_PIN, 127)
     updateConsole("Alarm Active");
   }
 }
@@ -208,7 +232,6 @@ void disableAlarm() {
   }
 }
 
-#if WATERMODE == true
 void openTap() {
   if(0 == digitalRead(SOLENOID_PIN)) {
     digitalWrite(SOLENOID_PIN, HIGH);
@@ -221,7 +244,6 @@ void closeTap() {
     digitalWrite(SOLENOID_PIN, LOW);
   }
 }
-#endif
 
 void updateDisplay() {
     String depthMsg = String("Depth: ") + getAverageDepth();
