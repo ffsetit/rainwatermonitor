@@ -25,4 +25,4 @@ jobs:
               version: 2.8.0
           cli-compile-flags: |
             --build-property build.arduino.extra_flags="-DCI_BUILD"
-
+          verbose: true
