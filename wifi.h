@@ -1,6 +1,12 @@
 #include <PubSubClient.h>
 #include <WiFiNINA.h>
+
+#ifdef CI_BUILD
+#define SECRET_SSID "dummy_ssid"
+#define SECRET_PASS "dummy_pass"
+#else
 #include "arduino_secrets.h"
+#endif
 
 
 char ssid[] = SECRET_SSID;    // your network SSID (name)
