@@ -8,20 +8,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Arduino CLI
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-          ./bin/arduino-cli config init
-          ./bin/arduino-cli core update-index
-          ./bin/arduino-cli core install arduino:avr
-          ./bin/arduino-cli core install arduino:megaavr
+      - uses: arduino/compile-sketches@v1
+        name: compile
+        with:
+          fqbn: "arduino:megaavr:uno2018"
+          sketch-paths: |
+            - .
+          libraries: |
+            - name: NewPing
+              version: 1.9.7
+            - name: LiquidCrystal
+              version: 1.0.7
+            - name: WiFiNINA
+              version: 1.91
+            - name: PubSubClient
+              version: 2.8.0
+          cli-compile-flags: |
+            --build-property build.arduino.extra_flags="-DCI_BUILD"
 
-      - name: Install Arduino Libraries
-        run: |
-          ./bin/arduino-cli lib install "NewPing"
-          ./bin/arduino-cli lib install "LiquidCrystal"
-          ./bin/arduino-cli lib install "WiFiNINA"
-          ./bin/arduino-cli lib install "PubSubClient"
-
-      - name: Compile
-        run: ./bin/arduino-cli compile --fqbn arduino:megaavr:uno2018 --log --log-level trace . --build-property build.extra_flags="-DCI_BUILD -DARDUINO=10607 -DARDUINO_AVR_UNO_WIFI_REV2 -DARDUINO_ARCH_MEGAAVR -DUNO_WIFI_REV2_328MODE"
