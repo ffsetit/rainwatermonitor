@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <PubSubClient.h>
 #include <WiFiNINA.h>
+#include <string.h>
 #include "arduino_secrets.h"
 #include "mqtt.h"
 #include "diagnostics_server.h"
@@ -23,6 +24,23 @@ const char* wifiIpTopic = "rainwatertank/network/ip";
 const char* wifiSsidTopic = "rainwatertank/network/ssid";
 const char* wifiSignalTopic = "rainwatertank/network/signal";
 const char* sensorStateTopic = "rainwatertank/sensor/state";
+const char* alarmMutedTopic = "rainwatertank/tank/alarm_muted";
+const char* alarmMuteCommandTopic = "rainwatertank/tank/alarm_muted/set";
+bool muteCommandPending = false;
+bool requestedMuteState = false;
+bool currentAlarmMutedState = false;
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (strcmp(topic, alarmMuteCommandTopic) != 0) return;
+  if (length == 2 && memcmp(payload, "ON", 2) == 0) {
+    requestedMuteState = true;
+  } else if (length == 3 && memcmp(payload, "OFF", 3) == 0) {
+    requestedMuteState = false;
+  } else {
+    return;
+  }
+  muteCommandPending = true;
+}
 
 void publishConfig(const char* component, const char* objectId, const char* payload) {
   String topic = String(discoveryTopic) + component + "/" + deviceIdentifier + "/" + objectId + "/config";
@@ -66,9 +84,7 @@ void publishDiscovery() {
       "payload_not_available": "offline",
       "device": {
         "identifiers": ["rainwatertank"],
-        "name": "Water Tank Sensor",
-        "manufacturer": "Pete Barnes",
-        "model": "TankMonitor on Arduini Uno Wifi Rev2"
+        "name": "Water Tank Sensor"
       }
     })");
 
@@ -85,9 +101,7 @@ void publishDiscovery() {
       "payload_not_available": "offline",
       "device": {
         "identifiers": ["rainwatertank"],
-        "name": "Water Tank Sensor",
-        "manufacturer": "Pete Barnes",
-        "model": "TankMonitor on Arduini Uno Wifi Rev2"
+        "name": "Water Tank Sensor"
       }
     })");
 
@@ -102,9 +116,7 @@ void publishDiscovery() {
       "payload_not_available": "offline",
       "device": {
         "identifiers": ["rainwatertank"],
-        "name": "Water Tank Sensor",
-        "manufacturer": "Pete Barnes",
-        "model": "TankMonitor on Arduini Uno Wifi Rev2"
+        "name": "Water Tank Sensor"
       }
     })");
 
@@ -118,7 +130,7 @@ void publishDiscovery() {
       "availability_topic": "rainwatertank/status",
       "payload_available": "online",
       "payload_not_available": "offline",
-      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor", "manufacturer": "Pete Barnes", "model": "TankMonitor on Arduini Uno Wifi Rev2"}
+      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor"}
     })");
 
   publishConfig("sensor", "wifi_ssid",
@@ -131,7 +143,7 @@ void publishDiscovery() {
       "availability_topic": "rainwatertank/status",
       "payload_available": "online",
       "payload_not_available": "offline",
-      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor", "manufacturer": "Pete Barnes", "model": "TankMonitor on Arduini Uno Wifi Rev2"}
+      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor"}
     })");
 
   publishConfig("sensor", "wifi_signal",
@@ -147,7 +159,7 @@ void publishDiscovery() {
       "availability_topic": "rainwatertank/status",
       "payload_available": "online",
       "payload_not_available": "offline",
-      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor", "manufacturer": "Pete Barnes", "model": "TankMonitor on Arduini Uno Wifi Rev2"}
+      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor"}
     })");
 
   publishConfig("sensor", "sensor_state",
@@ -160,7 +172,23 @@ void publishDiscovery() {
       "availability_topic": "rainwatertank/status",
       "payload_available": "online",
       "payload_not_available": "offline",
-      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor", "manufacturer": "Pete Barnes", "model": "TankMonitor on Arduini Uno Wifi Rev2"}
+      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor"}
+    })");
+
+  publishConfig("switch", "alarm_mute",
+    R"({
+      "name": "Mute Alarm",
+      "state_topic": "rainwatertank/tank/alarm_muted",
+      "command_topic": "rainwatertank/tank/alarm_muted/set",
+      "payload_on": "ON",
+      "payload_off": "OFF",
+      "entity_category": "diagnostic",
+      "icon": "mdi:volume-off",
+      "unique_id": "rainwatertank_alarm_mute_control",
+      "availability_topic": "rainwatertank/status",
+      "payload_available": "online",
+      "payload_not_available": "offline",
+      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor"}
     })");
 }
 }
@@ -169,6 +197,7 @@ void configureMqtt() {
   mqttClient.setServer(mqttServer, mqttPort);
   mqttClient.setKeepAlive(60);
   mqttClient.setBufferSize(1000);
+  mqttClient.setCallback(mqttCallback);
 }
 
 const char* getMqttHost() {
@@ -184,7 +213,10 @@ void connectToMqtt() {
   if (mqttClient.connect(clientId, nullptr, nullptr, statusTopic, 0, true, "offline")) {
     consoleLog(F("MQTT connected"));
     mqttClient.publish(statusTopic, "online", true);
+    mqttClient.publish("homeassistant/binary_sensor/rainwatertank/alarm_muted/config", "", true);
     publishDiscovery();
+    mqttClient.subscribe(alarmMuteCommandTopic);
+    publishAlarmMuted(currentAlarmMutedState);
   } else {
     consoleLog(String(F("Failed, rc=")) + mqttClient.state());
   }
@@ -195,7 +227,7 @@ void pollMqtt() {
 }
 
 void publishSensorData(float depth, bool tapOpen, bool alarmOn, String errorMsg,
-                       unsigned long lastReading, const char* sensorState) {
+                       unsigned long lastReading, const char* sensorState, bool alarmMuted) {
   (void)lastReading;
   char buffer[16];
   dtostrf(depth, 0, 1, buffer);
@@ -213,4 +245,17 @@ void publishSensorData(float depth, bool tapOpen, bool alarmOn, String errorMsg,
   mqttClient.publish(wifiSsidTopic, WiFi.SSID(), false);
   mqttClient.publish(wifiSignalTopic, signal, false);
   mqttClient.publish(sensorStateTopic, sensorState, false);
+  publishAlarmMuted(alarmMuted);
+}
+
+void publishAlarmMuted(bool alarmMuted) {
+  currentAlarmMutedState = alarmMuted;
+  mqttClient.publish(alarmMutedTopic, alarmMuted ? "ON" : "OFF", false);
+}
+
+bool consumeMqttAlarmMuteCommand(bool& muted) {
+  if (!muteCommandPending) return false;
+  muted = requestedMuteState;
+  muteCommandPending = false;
+  return true;
 }

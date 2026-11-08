@@ -29,6 +29,7 @@ const unsigned long inputTimeout = 300000UL;
 
 enum SensorState { SENSOR_NORMAL, SENSOR_WARNING, SENSOR_FAULT, SENSOR_RECOVERY };
 const char* sensorStateName(SensorState state);
+void applyAlarmMute(bool muted);
 SensorState sensorState = SENSOR_NORMAL;
 int consecutiveInvalidReadings = 0;
 int consecutiveValidReadings = 0;
@@ -36,6 +37,7 @@ bool sensorInitialized = false;
 bool levelMonitoringReady = false;
 float recoveryReadings[RECOVERY_READINGS_REQUIRED];
 char sensorFaultReason[48] = "";
+bool alarmMuted = false;
 bool levelAlarm = false; // Booolean to hold the level status
 
 
@@ -131,10 +133,15 @@ void loop() {
   // Do other stuff here, really. Think of it as multi-tasking.
   
   pollMqtt();
-  updateWebDiagnostics(getAverageDepth(), validReadingCount > 0, inputTimer,
+  bool mqttMuteState;
+  if (consumeMqttAlarmMuteCommand(mqttMuteState)) applyAlarmMute(mqttMuteState);
+  updateWebDiagnostics(getAverageDepth(), validReadingCount > 0, sensorInitialized, inputTimer,
                        sensorStateName(sensorState), consecutiveInvalidReadings,
-                       consecutiveValidReadings, levelAlarm, fill, checkMqttConnection());
+                       consecutiveValidReadings, alarmShouldBeActive(), alarmMuted, fill, checkMqttConnection());
   handleDiagnosticsServer();
+
+  bool requestedMuteState;
+  if (consumeAlarmMuteCommand(requestedMuteState)) applyAlarmMute(requestedMuteState);
 
   now = millis();
   if (now - refreshTimer >= refreshDuration) {
@@ -154,7 +161,7 @@ void loop() {
     }
     
     publishSensorData(getAverageDepth(), fill, alarmShouldBeActive(), getErrorMessage(), inputTimer,
-                      sensorStateName(sensorState));
+                      sensorStateName(sensorState), alarmMuted);
   }
 }
 
@@ -185,9 +192,17 @@ bool alarmShouldBeActive() {
   return levelAlarm || sensorState == SENSOR_FAULT || sensorState == SENSOR_RECOVERY;
 }
 
+void applyAlarmMute(bool muted) {
+  if (alarmMuted == muted) return;
+  alarmMuted = muted;
+  updateConsole(alarmMuted ? "Alarm Muted" : "Alarm Unmuted");
+  updateOutputs();
+  publishAlarmMuted(alarmMuted);
+}
+
 void updateOutputs() {
   bool shouldFill = sensorState == SENSOR_NORMAL && levelAlarm;
-  bool shouldAlarm = alarmShouldBeActive();
+  bool shouldAlarm = alarmShouldBeActive() && !alarmMuted;
 
   if (fill != shouldFill) {
     digitalWrite(SOLENOID_PIN, shouldFill ? HIGH : LOW);
@@ -196,7 +211,7 @@ void updateOutputs() {
   }
   if (digitalRead(BUZZER_PIN) != (shouldAlarm ? HIGH : LOW)) {
     digitalWrite(BUZZER_PIN, shouldAlarm ? HIGH : LOW);
-    updateConsole(shouldAlarm ? "Alarm Active" : "Alarm Inactive");
+    updateConsole(shouldAlarm ? "Alarm Active" : (alarmShouldBeActive() ? "Alarm Output Muted" : "Alarm Inactive"));
   }
 }
 
