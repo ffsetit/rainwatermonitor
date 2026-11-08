@@ -11,6 +11,8 @@
 
 #define MAX_DISTANCE 250 // Maximum distance we want to ping for (in centimeters). Maximum sensor distance is rated at 400-500cm.
 #define NUM_READINGS 10
+#define MAX_INVALID_READINGS 3
+#define RECOVERY_READINGS_REQUIRED 5
 
 const bool debug = false;
 
@@ -23,9 +25,17 @@ const unsigned long refreshDuration = 10000; // holds the interval to refresh sc
 
 //These settings control the error threshold when no data is receieved from the ultrasonic sensor
 unsigned long inputTimer; // time of the last valid sensor reading
-unsigned long inputTimeout = 300000; // Duration in seconds to wait for sensor data before sounding the alarm  [5 minutes](in milliseconds)
+const unsigned long inputTimeout = 300000UL;
 
-bool inputError = false; // Boolean to hold the alarm state when no data is recieved from the sensor
+enum SensorState { SENSOR_NORMAL, SENSOR_WARNING, SENSOR_FAULT, SENSOR_RECOVERY };
+const char* sensorStateName(SensorState state);
+SensorState sensorState = SENSOR_NORMAL;
+int consecutiveInvalidReadings = 0;
+int consecutiveValidReadings = 0;
+bool sensorInitialized = false;
+bool levelMonitoringReady = false;
+float recoveryReadings[RECOVERY_READINGS_REQUIRED];
+char sensorFaultReason[48] = "";
 bool levelAlarm = false; // Booolean to hold the level status
 
 
@@ -34,7 +44,6 @@ bool fill = false; // Used to track if the tank is currently filling
 int sensorHeight = 197; // Height of the sensor above the bottom of the tank
 int tankDepth = 170; // Maximum depth of the tank content
 int minDepth = 10; // Level at which the low level alarm is triggered
-bool initialized = false; // Value used to determine if the ultra sonic sensor is connected and has returned a valid reading
 
 int readingPos = 0; // Next array index to write
 int validReadingCount = 0; // Number of initialized entries in readings[]
@@ -64,9 +73,7 @@ void setup() {
     updateConsole("==================");
   }
   
-  pingTimer = millis() - pingSpeed; // Take the first reading immediately.
-  inputTimer = millis(); // Start now.
-  refreshTimer = millis(); // Start now.
+  refreshTimer = millis();
   
   lcd.begin(16, 2); // lcd starts with resolution 16x2
   lcd.setCursor(0, 0);
@@ -79,6 +86,9 @@ void setup() {
   configureMqtt();
   connectToMqtt();
 
+  pingTimer = millis() - pingSpeed; // Take the first reading immediately.
+  inputTimer = millis(); // Start the initial sensor timeout after network setup.
+
   updateConsole("Initializing Depth Sensor");
   
   pinMode(SOLENOID_PIN, OUTPUT);
@@ -86,6 +96,8 @@ void setup() {
   pinMode(TRIGGER_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   digitalWrite(TRIGGER_PIN, LOW);
+  digitalWrite(SOLENOID_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
 }
 
 void loop() {
@@ -105,17 +117,23 @@ void loop() {
       if (distanceCm > 0) {
         int depth = sensorHeight - (int)distanceCm;
         if (depth >= 0 && depth <= tankDepth) {
-          inputTimer = millis();
-          inputError = false;
-          updateResults(depth);
+          handleSensorReading((float)depth);
+        } else {
+          handleInvalidReading(distanceCm);
         }
+      } else {
+        handleInvalidReading(0);
       }
     }
+
+  checkSensorTimeout();
+  updateOutputs();
   // Do other stuff here, really. Think of it as multi-tasking.
   
   pollMqtt();
   updateWebDiagnostics(getAverageDepth(), validReadingCount > 0, inputTimer,
-                       inputError, levelAlarm, fill, checkMqttConnection());
+                       sensorStateName(sensorState), consecutiveInvalidReadings,
+                       consecutiveValidReadings, levelAlarm, fill, checkMqttConnection());
   handleDiagnosticsServer();
 
   now = millis();
@@ -125,20 +143,7 @@ void loop() {
     }
 
     refreshTimer = now;
-    checkError();
-    
-    if(inputError) {
-      writeError();
-      enableAlarm();
-      closeTap();
-    }
-    if (levelAlarm && !inputError) {
-      enableAlarm();
-      openTap();
-    } 
-    if(!inputError and !levelAlarm) {
-      disableAlarm();
-    }
+    updateDisplay();
 
     if(!checkConnection())
     {
@@ -148,42 +153,142 @@ void loop() {
       connectToMqtt();
     }
     
-    publishSensorData(getAverageDepth(), fill, levelAlarm or inputError, inputError ? getErrorMessage() : "", inputTimer);
+    publishSensorData(getAverageDepth(), fill, alarmShouldBeActive(), getErrorMessage(), inputTimer,
+                      sensorStateName(sensorState));
   }
 }
 
-void checkError() {
-  if(debug) {
-    updateConsole("checkError Called");
-  }
-
-  unsigned long currentMillis = millis();
-  unsigned long timeSinceLastPing = (currentMillis - inputTimer);
-
-  if( timeSinceLastPing > inputTimeout ) {
-    inputError = true;
+const char* sensorStateName(SensorState state) {
+  switch (state) {
+    case SENSOR_WARNING: return "WARNING";
+    case SENSOR_FAULT: return "FAULT";
+    case SENSOR_RECOVERY: return "RECOVERY";
+    default: return "NORMAL";
   }
 }
 
-void updateResults(int depth) {
-  if(debug) {
-    updateConsole("updateResults Called");
+void resetReadings() {
+  for (int i = 0; i < NUM_READINGS; ++i) readings[i] = 0;
+  readingPos = 0;
+  validReadingCount = 0;
+}
+
+void recalculateLevelAlarm() {
+  #if HIGHLEVEL == true
+    levelAlarm = getAverageDepth() > maxDepth;
+  #else
+    levelAlarm = getAverageDepth() < minDepth;
+  #endif
+}
+
+bool alarmShouldBeActive() {
+  return levelAlarm || sensorState == SENSOR_FAULT || sensorState == SENSOR_RECOVERY;
+}
+
+void updateOutputs() {
+  bool shouldFill = sensorState == SENSOR_NORMAL && levelAlarm;
+  bool shouldAlarm = alarmShouldBeActive();
+
+  if (fill != shouldFill) {
+    digitalWrite(SOLENOID_PIN, shouldFill ? HIGH : LOW);
+    fill = shouldFill;
+    updateConsole(shouldFill ? "Solenoid Open" : "Solenoid Closed");
+  }
+  if (digitalRead(BUZZER_PIN) != (shouldAlarm ? HIGH : LOW)) {
+    digitalWrite(BUZZER_PIN, shouldAlarm ? HIGH : LOW);
+    updateConsole(shouldAlarm ? "Alarm Active" : "Alarm Inactive");
+  }
+}
+
+void enterSensorFault(const String& reason) {
+  if (sensorState == SENSOR_FAULT) return;
+
+  sensorState = SENSOR_FAULT;
+  consecutiveValidReadings = 0;
+  reason.toCharArray(sensorFaultReason, sizeof(sensorFaultReason));
+  levelAlarm = false;
+  levelMonitoringReady = false;
+  resetReadings();
+  updateConsole(String("SENSOR FAULT: ") + reason);
+  updateDisplay();
+  updateOutputs();
+}
+
+void checkSensorTimeout() {
+  if (sensorState != SENSOR_FAULT && millis() - inputTimer >= inputTimeout) {
+    enterSensorFault("No valid sensor reading for 5 minutes");
+  }
+}
+
+void handleInvalidReading(unsigned int distanceCm) {
+  updateConsole(String("Invalid sensor reading: ") + distanceCm + " cm");
+  consecutiveValidReadings = 0;
+
+  if (sensorState == SENSOR_RECOVERY) {
+    enterSensorFault("Invalid reading during recovery");
+    return;
+  }
+  if (!sensorInitialized || sensorState == SENSOR_FAULT) return;
+
+  if (consecutiveInvalidReadings < MAX_INVALID_READINGS) {
+    ++consecutiveInvalidReadings;
+  }
+  if (consecutiveInvalidReadings >= MAX_INVALID_READINGS) {
+    enterSensorFault("Three consecutive invalid readings");
+    return;
+  }
+  if (sensorState == SENSOR_NORMAL) {
+    sensorState = SENSOR_WARNING;
+    updateConsole("Sensor Warning");
+    updateDisplay();
+  }
+}
+
+void handleSensorReading(float depth) {
+  inputTimer = millis();
+  sensorInitialized = true;
+  consecutiveInvalidReadings = 0;
+
+  if (sensorState == SENSOR_FAULT || sensorState == SENSOR_RECOVERY) {
+    if (sensorState == SENSOR_FAULT) {
+      sensorState = SENSOR_RECOVERY;
+      consecutiveValidReadings = 0;
+      updateConsole("Sensor Recovery Started");
+    }
+
+    recoveryReadings[consecutiveValidReadings++] = depth;
+    updateConsole(String("Recovery Reading: ") + consecutiveValidReadings + "/" + RECOVERY_READINGS_REQUIRED);
+    if (consecutiveValidReadings < RECOVERY_READINGS_REQUIRED) {
+      updateDisplay();
+      return;
+    }
+
+    resetReadings();
+    for (int i = 0; i < RECOVERY_READINGS_REQUIRED; ++i) readings[i] = recoveryReadings[i];
+    validReadingCount = RECOVERY_READINGS_REQUIRED;
+    readingPos = validReadingCount % NUM_READINGS;
+    levelMonitoringReady = true;
+    sensorState = SENSOR_NORMAL;
+    consecutiveValidReadings = 0;
+    recalculateLevelAlarm();
+    updateConsole(String("Sensor Recovery Successful. Depth: ") + String(getAverageDepth(), 1) + "cm");
+    updateDisplay();
+    updateOutputs();
+    return;
   }
 
+  if (sensorState == SENSOR_WARNING) {
+    sensorState = SENSOR_NORMAL;
+    updateConsole("Sensor Warning Cleared");
+  }
+  consecutiveValidReadings = 0;
   readings[readingPos] = depth;
   readingPos = (readingPos + 1) % NUM_READINGS;
-  if (validReadingCount < NUM_READINGS) {
-    validReadingCount++;
-  }
-  initialized = validReadingCount == NUM_READINGS;
-  if(initialized) {
-    #if HIGHLEVEL == true
-      levelAlarm = getAverageDepth() > maxDepth; //Set error if the level is above maximum
-    #else
-      levelAlarm = getAverageDepth() < minDepth; //Set error if the level is below minimum
-    #endif
-  }
+  if (validReadingCount < NUM_READINGS) ++validReadingCount;
+  if (validReadingCount == NUM_READINGS) levelMonitoringReady = true;
+  if (levelMonitoringReady) recalculateLevelAlarm();
   updateDisplay();
+  updateOutputs();
 }
 
 float getAverageDepth() {
@@ -202,73 +307,58 @@ float getRemainingPercentage() {
   return percentRemaining;
 }
 
-int getErrorDuration() {
-  unsigned long currentMillis = millis();
-  unsigned long timeSinceLastPing = (currentMillis - inputTimer);
-
-  return timeSinceLastPing/1000;
-}
-
 String getErrorMessage() {
-  if(debug) {
-    updateConsole("getErrorMessage Called");
-  }
-
-  String msg = "No sensor data for " + (String)getErrorDuration() + " seconds";
-  return msg;
-}
-
-void writeError() {
-  String msg = getErrorMessage();
-  updateConsole(msg);
-  
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("No Sensor Data");
-  lcd.setCursor(0, 1);
-  lcd.print("in " + (String)getErrorDuration() + "s");
-
-}
-
-void enableAlarm() {
-  if(0 == digitalRead(BUZZER_PIN)) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    //analogWrite(BUZZER_PIN, 127)
-    updateConsole("Alarm Active");
-  }
-}
-
-void disableAlarm() {
-  if(1 == digitalRead(BUZZER_PIN)) {
-    digitalWrite(BUZZER_PIN, LOW);
-    updateConsole("Alarm Inactive");
-  }
-}
-
-void openTap() {
-  if(0 == digitalRead(SOLENOID_PIN)) {
-    digitalWrite(SOLENOID_PIN, HIGH);
-    fill = true;
-  }
-}
-
-void closeTap() {
-  if(fill) {
-    digitalWrite(SOLENOID_PIN, LOW);
-    fill = false;
+  switch (sensorState) {
+    case SENSOR_WARNING:
+      return String("Sensor warning: ") + consecutiveInvalidReadings + "/" + MAX_INVALID_READINGS + " invalid readings";
+    case SENSOR_FAULT:
+      return String("Sensor fault: ") + sensorFaultReason + " (last valid " +
+             ((millis() - inputTimer) / 1000UL) + "s ago)";
+    case SENSOR_RECOVERY:
+      return String("Sensor recovery: ") + consecutiveValidReadings + "/" + RECOVERY_READINGS_REQUIRED + " valid readings";
+    default:
+      return "";
   }
 }
 
 void updateDisplay() {
-    String depthMsg = String("Depth: ") + String(getAverageDepth(), 1);
-    String percentageMsg = getRemainingPercentage() + String("% Remaining");
-    updateConsole(depthMsg + " " + percentageMsg);
-  
-    lcd.clear();
+  lcd.clear();
+  if (sensorState == SENSOR_FAULT) {
     lcd.setCursor(0, 0);
-    lcd.print(depthMsg);
+    lcd.print("Sensor Fault");
     lcd.setCursor(0, 1);
-    lcd.print(percentageMsg);
+    lcd.print("Check Sensor!");
+    return;
+  }
+  if (sensorState == SENSOR_RECOVERY) {
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor Recovery");
+    lcd.setCursor(0, 1);
+    lcd.print(String(consecutiveValidReadings) + "/" + RECOVERY_READINGS_REQUIRED + " Valid");
+    return;
+  }
+  if (sensorState == SENSOR_WARNING) {
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor Warning");
+    lcd.setCursor(0, 1);
+    lcd.print("Checking Sensor");
+    return;
+  }
+  if (validReadingCount == 0) {
+    lcd.setCursor(0, 0);
+    lcd.print("Waiting for");
+    lcd.setCursor(0, 1);
+    lcd.print("Sensor Data");
+    return;
+  }
+
+  String depthMsg = String("Depth: ") + String(getAverageDepth(), 1) + "cm";
+  String percentageMsg = String(getRemainingPercentage(), 1) + "% Remaining";
+  lcd.setCursor(0, 0);
+  lcd.print(depthMsg);
+  lcd.setCursor(0, 1);
+  lcd.print(percentageMsg);
+  updateConsole(depthMsg + " " + percentageMsg);
 }
 
 void updateConsole(String message) {

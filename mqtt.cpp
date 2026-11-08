@@ -19,6 +19,10 @@ const char* tankDepthTopic = "rainwatertank/tank/depth";
 const char* alarmTopic = "rainwatertank/tank/alarm";
 const char* fillingTopic = "rainwatertank/tank/filling";
 const char* errorTopic = "rainwatertank/tank/error";
+const char* wifiIpTopic = "rainwatertank/network/ip";
+const char* wifiSsidTopic = "rainwatertank/network/ssid";
+const char* wifiSignalTopic = "rainwatertank/network/signal";
+const char* sensorStateTopic = "rainwatertank/sensor/state";
 
 void publishConfig(const char* component, const char* objectId, const char* payload) {
   String topic = String(discoveryTopic) + component + "/" + deviceIdentifier + "/" + objectId + "/config";
@@ -103,6 +107,61 @@ void publishDiscovery() {
         "model": "TankMonitor on Arduini Uno Wifi Rev2"
       }
     })");
+
+  publishConfig("sensor", "wifi_ip",
+    R"({
+      "name": "Wi-Fi IP Address",
+      "state_topic": "rainwatertank/network/ip",
+      "entity_category": "diagnostic",
+      "icon": "mdi:ip-network",
+      "unique_id": "rainwatertank_wifi_ip",
+      "availability_topic": "rainwatertank/status",
+      "payload_available": "online",
+      "payload_not_available": "offline",
+      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor", "manufacturer": "Pete Barnes", "model": "TankMonitor on Arduini Uno Wifi Rev2"}
+    })");
+
+  publishConfig("sensor", "wifi_ssid",
+    R"({
+      "name": "Wi-Fi SSID",
+      "state_topic": "rainwatertank/network/ssid",
+      "entity_category": "diagnostic",
+      "icon": "mdi:wifi",
+      "unique_id": "rainwatertank_wifi_ssid",
+      "availability_topic": "rainwatertank/status",
+      "payload_available": "online",
+      "payload_not_available": "offline",
+      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor", "manufacturer": "Pete Barnes", "model": "TankMonitor on Arduini Uno Wifi Rev2"}
+    })");
+
+  publishConfig("sensor", "wifi_signal",
+    R"({
+      "name": "Wi-Fi Signal",
+      "state_topic": "rainwatertank/network/signal",
+      "entity_category": "diagnostic",
+      "device_class": "signal_strength",
+      "state_class": "measurement",
+      "unit_of_measurement": "dBm",
+      "icon": "mdi:wifi",
+      "unique_id": "rainwatertank_wifi_signal",
+      "availability_topic": "rainwatertank/status",
+      "payload_available": "online",
+      "payload_not_available": "offline",
+      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor", "manufacturer": "Pete Barnes", "model": "TankMonitor on Arduini Uno Wifi Rev2"}
+    })");
+
+  publishConfig("sensor", "sensor_state",
+    R"({
+      "name": "Sensor State",
+      "state_topic": "rainwatertank/sensor/state",
+      "entity_category": "diagnostic",
+      "icon": "mdi:state-machine",
+      "unique_id": "rainwatertank_sensor_state",
+      "availability_topic": "rainwatertank/status",
+      "payload_available": "online",
+      "payload_not_available": "offline",
+      "device": {"identifiers": ["rainwatertank"], "name": "Water Tank Sensor", "manufacturer": "Pete Barnes", "model": "TankMonitor on Arduini Uno Wifi Rev2"}
+    })");
 }
 }
 
@@ -135,7 +194,8 @@ void pollMqtt() {
   mqttClient.loop();
 }
 
-void publishSensorData(float depth, bool tapOpen, bool alarmOn, String errorMsg, unsigned long lastReading) {
+void publishSensorData(float depth, bool tapOpen, bool alarmOn, String errorMsg,
+                       unsigned long lastReading, const char* sensorState) {
   (void)lastReading;
   char buffer[16];
   dtostrf(depth, 0, 1, buffer);
@@ -143,4 +203,14 @@ void publishSensorData(float depth, bool tapOpen, bool alarmOn, String errorMsg,
   mqttClient.publish(alarmTopic, alarmOn ? "ON" : "OFF", false);
   mqttClient.publish(fillingTopic, tapOpen ? "ON" : "OFF", false);
   mqttClient.publish(errorTopic, errorMsg.c_str(), false);
+
+  IPAddress ip = WiFi.localIP();
+  char ipAddress[16];
+  snprintf(ipAddress, sizeof(ipAddress), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  char signal[8];
+  snprintf(signal, sizeof(signal), "%ld", (long)WiFi.RSSI());
+  mqttClient.publish(wifiIpTopic, ipAddress, false);
+  mqttClient.publish(wifiSsidTopic, WiFi.SSID(), false);
+  mqttClient.publish(wifiSignalTopic, signal, false);
+  mqttClient.publish(sensorStateTopic, sensorState, false);
 }
