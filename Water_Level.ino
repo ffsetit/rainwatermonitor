@@ -1,6 +1,7 @@
-#include <NewPing.h>
 #include <LiquidCrystal.h>
-#include "wifi.h"
+#include "wifi_config.h"
+#include "mqtt.h"
+#include "diagnostics_server.h"
 
 //These Settings define the physical pins used for the various inputs/outputs
 #define TRIGGER_PIN  13  // Arduino pin tied to trigger pin on ping sensor.
@@ -11,22 +12,20 @@
 #define MAX_DISTANCE 250 // Maximum distance we want to ping for (in centimeters). Maximum sensor distance is rated at 400-500cm.
 #define NUM_READINGS 10
 
-NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE); // NewPing setup of pins and maximum distance.
-
 const bool debug = false;
 
 unsigned int pingSpeed = 2500; // How frequently are we going to send out a ping (in milliseconds). 50ms would be 20 times a second.
-unsigned long pingTimer;     // Holds the next ping time.
+unsigned long pingTimer;     // Time of the last ping.
 
 //These setting control how often the LCD Display is updated
 unsigned long refreshTimer; // holds the time since the last display update
 const unsigned long refreshDuration = 10000; // holds the interval to refresh screen / serial output (in milliseconds)
 
 //These settings control the error threshold when no data is receieved from the ultrasonic sensor
-volatile unsigned long inputTimer; // holds the time since the last sensor was recieved
+unsigned long inputTimer; // time of the last valid sensor reading
 unsigned long inputTimeout = 300000; // Duration in seconds to wait for sensor data before sounding the alarm  [5 minutes](in milliseconds)
 
-volatile bool inputError = false; // Boolean to hold the alarm state when no data is recieved from the sensor
+bool inputError = false; // Boolean to hold the alarm state when no data is recieved from the sensor
 bool levelAlarm = false; // Booolean to hold the level status
 
 
@@ -37,7 +36,8 @@ int tankDepth = 170; // Maximum depth of the tank content
 int minDepth = 10; // Level at which the low level alarm is triggered
 bool initialized = false; // Value used to determine if the ultra sonic sensor is connected and has returned a valid reading
 
-int readingPos = 0; // Array index used to determine where to store the latest depth reading
+int readingPos = 0; // Next array index to write
+int validReadingCount = 0; // Number of initialized entries in readings[]
 int readings[NUM_READINGS]; //  Array of depth readings
 
 bool attachConsole = true; // Set this to false to disable the Serial console output
@@ -64,7 +64,7 @@ void setup() {
     updateConsole("==================");
   }
   
-  pingTimer = millis(); // Start now.
+  pingTimer = millis() - pingSpeed; // Take the first reading immediately.
   inputTimer = millis(); // Start now.
   refreshTimer = millis(); // Start now.
   
@@ -75,24 +75,51 @@ void setup() {
   lcd.print("  Depth Sensor");
 
   configureWifi();
+  startDiagnosticsServer();
+  configureMqtt();
+  connectToMqtt();
 
   updateConsole("Initializing Depth Sensor");
   
   pinMode(SOLENOID_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(TRIGGER_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIGGER_PIN, LOW);
 }
 
 void loop() {
-    if (millis() >= pingTimer) {   // pingSpeed milliseconds since last ping, do another ping.
-      pingTimer += pingSpeed;      // Set the next ping time.
-      sonar.ping_timer(echoCheck); // Send out the ping, calls "echoCheck" function every 24uS where you can check the ping status.
+    unsigned long now = millis();
+    if (now - pingTimer >= pingSpeed) {
+      pingTimer = now;
+      // pulseIn is synchronous, so no timer callback or shared ISR state is needed.
+      // 58 us is approximately the round-trip time per centimeter.
+      digitalWrite(TRIGGER_PIN, LOW);
+      delayMicroseconds(2);
+      digitalWrite(TRIGGER_PIN, HIGH);
+      delayMicroseconds(10);
+      digitalWrite(TRIGGER_PIN, LOW);
+      const unsigned long echoTimeoutUs = (MAX_DISTANCE * 58UL) + 1000UL;
+      unsigned long echoTime = pulseIn(ECHO_PIN, HIGH, echoTimeoutUs);
+      unsigned int distanceCm = echoTime == 0 ? 0 : (unsigned int)((echoTime + 29UL) / 58UL);
+      if (distanceCm > 0) {
+        int depth = sensorHeight - (int)distanceCm;
+        if (depth >= 0 && depth <= tankDepth) {
+          inputTimer = millis();
+          inputError = false;
+          updateResults(depth);
+        }
+      }
     }
   // Do other stuff here, really. Think of it as multi-tasking.
   
   pollMqtt();
+  updateWebDiagnostics(getAverageDepth(), validReadingCount > 0, inputTimer,
+                       inputError, levelAlarm, fill, checkMqttConnection());
+  handleDiagnosticsServer();
 
-  unsigned long now = millis();
-  if( now  - refreshDuration > refreshTimer ) {
+  now = millis();
+  if (now - refreshTimer >= refreshDuration) {
     if(debug) {
       updateConsole("Refreshing....");
     }
@@ -105,7 +132,7 @@ void loop() {
       enableAlarm();
       closeTap();
     }
-    if (levelAlarm) {
+    if (levelAlarm && !inputError) {
       enableAlarm();
       openTap();
     } 
@@ -123,18 +150,6 @@ void loop() {
     
     publishSensorData(getAverageDepth(), fill, levelAlarm or inputError, inputError ? getErrorMessage() : "", inputTimer);
   }
-}
-
-void echoCheck() { // Timer2 interrupt calls this function every 24uS where you can check the ping status.
-  // Don't do anything here!
-  if (sonar.check_timer()) { // This is how you check to see if the ping was received.
-    inputTimer = millis(); // Update last ping recieved time
-    int depth = sensorHeight - (sonar.ping_result / US_ROUNDTRIP_CM);
-
-    inputError = false;
-    updateResults(depth);
-  }
-  // Don't do anything here!
 }
 
 void checkError() {
@@ -155,14 +170,12 @@ void updateResults(int depth) {
     updateConsole("updateResults Called");
   }
 
-  inputTimer = millis(); // Update last ping recieved time
-  if(readingPos >= NUM_READINGS) {
-    readingPos = 0;
-    initialized = true; 
-  } else {
-    readingPos++;
-  }
   readings[readingPos] = depth;
+  readingPos = (readingPos + 1) % NUM_READINGS;
+  if (validReadingCount < NUM_READINGS) {
+    validReadingCount++;
+  }
+  initialized = validReadingCount == NUM_READINGS;
   if(initialized) {
     #if HIGHLEVEL == true
       levelAlarm = getAverageDepth() > maxDepth; //Set error if the level is above maximum
@@ -175,11 +188,11 @@ void updateResults(int depth) {
 
 float getAverageDepth() {
   int total = 0;
-  for (int i = 0; i < NUM_READINGS; i++) {
+  for (int i = 0; i < validReadingCount; i++) {
       total += readings[i];
   }
-
-  return (float)total / (float)NUM_READINGS;
+  if (validReadingCount == 0) return 0.0f;
+  return (float)total / (float)validReadingCount;
 }
 
 float getRemainingPercentage() {
@@ -242,11 +255,12 @@ void openTap() {
 void closeTap() {
   if(fill) {
     digitalWrite(SOLENOID_PIN, LOW);
+    fill = false;
   }
 }
 
 void updateDisplay() {
-    String depthMsg = String("Depth: ") + getAverageDepth();
+    String depthMsg = String("Depth: ") + String(getAverageDepth(), 1);
     String percentageMsg = getRemainingPercentage() + String("% Remaining");
     updateConsole(depthMsg + " " + percentageMsg);
   
@@ -259,6 +273,6 @@ void updateDisplay() {
 
 void updateConsole(String message) {
   if(attachConsole) {
-    Serial.println(message);
+    consoleLog(message);
   }
 }
